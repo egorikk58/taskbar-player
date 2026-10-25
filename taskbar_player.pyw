@@ -4,9 +4,11 @@
 
 Откуда берётся трек:
   1. системные медиа-сессии Windows (приложение Яндекс Музыки, Spotify, Chrome…);
-  2. если их нет — читаем плеер прямо со страницы music.yandex.ru в браузере
-     через UI Automation (Яндекс Браузер не передаёт трек в Windows)."""
-import asyncio, ctypes, json, math, queue, re, sys, threading, time, urllib.request, winreg
+  2. расширение browser-extension/ — видит music.yandex.ru даже в фоновой вкладке
+     (Яндекс Браузер не передаёт трек в Windows);
+  3. без расширения — читаем плеер со страницы через UI Automation,
+     но так видна только активная вкладка."""
+import asyncio, ctypes, json, math, queue, re, sys, threading, time, urllib.parse, urllib.request, winreg
 from pathlib import Path
 
 import numpy as np
@@ -133,7 +135,7 @@ class SmtcSource:
         asyncio.run_coroutine_threadsafe(go(), self.loop)
 
 
-# ═════════════════ источник 2: страница Яндекс Музыки в браузере ═════════════════
+# ═════════════════ Яндекс Музыка: открытый API и обложки ═════════════════
 def http(url, timeout=5):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 TaskbarPlayer"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -146,15 +148,84 @@ def spoken_seconds(text):
     return sum(int(n) * units[u] for n, u in re.findall(r"(\d+)\s*(час|минут|секунд)", text or ""))
 
 
+_META, _COVERS = {}, {}         # ответы API и обложки — последние 64 штуки
+_CACHE_LOCK = threading.Lock()
+
+
+def remember(cache, key, value, limit=64):
+    with _CACHE_LOCK:
+        cache[key] = value
+        while len(cache) > limit:
+            cache.pop(next(iter(cache)))
+    return value
+
+
+def yandex_meta(kind, id_):
+    """Исполнители, длительность и обложка из открытого API Яндекс Музыки (авторизация не нужна)."""
+    key = (kind, id_)
+    if key in _META:
+        return _META[key]
+    meta = None
+    try:
+        url = f"https://api.music.yandex.net/tracks/{id_}" if kind == "track" else \
+              f"https://api.music.yandex.net/albums/{id_}/with-tracks"
+        res = json.loads(http(url))["result"]
+        res = res[0] if isinstance(res, list) else res
+
+        def info(t):
+            return {"artists": ", ".join(a["name"] for a in t.get("artists", [])),
+                    "dur": t.get("durationMs", 0) / 1000 or None}
+        meta = info(res)
+        if kind == "album":
+            meta["dur"] = None
+            meta["tracks"] = {t["title"].casefold(): info(t) for vol in res.get("volumes", []) for t in vol}
+        if uri := res.get("coverUri") or (res.get("albums") or [{}])[0].get("coverUri"):
+            meta["cover"] = http("https://" + uri.replace("%%", "400x400"))
+    except Exception:
+        pass
+    return remember(_META, key, meta)
+
+
+def cover_from(url):
+    """Обложка по адресу со страницы (avatars.yandex.net/…) — только с серверов Яндекса."""
+    if not isinstance(url, str) or not url.startswith("https://") or \
+            not (urllib.parse.urlsplit(url).hostname or "").endswith(".yandex.net"):
+        return None
+    if url not in _COVERS:
+        try:
+            data = http(url)
+        except Exception:
+            data = None
+        remember(_COVERS, url, data)
+    return _COVERS.get(url)
+
+
+def yandex_track(title, artists, playing, pos, dur, track_id=None, album_id=None, artwork=None):
+    """track() для Яндекс Музыки: чего не хватает на странице, добираем из API."""
+    cover = cover_from(artwork)
+    if not (cover and artists and dur):
+        meta = (yandex_meta("track", track_id) if track_id else
+                yandex_meta("album", album_id) if album_id else None) or {}
+        # в «Моей волне» ссылки на трек нет — ищем его по названию в треках альбома
+        song = meta.get("tracks", {}).get(title.casefold(), meta)
+        artists, dur = artists or song.get("artists", ""), dur or song.get("dur")
+        cover = cover or meta.get("cover")
+    return track(title or "—", artists, playing, cover, pos, dur)
+
+
+# ═════════════════ источник 2: страница Яндекс Музыки через UI Automation ═════════════════
 class YandexWebSource(threading.Thread):
-    def __init__(self):
+    """Читает блок «Плеер» со страницы. Браузер показывает Windows только активную вкладку,
+    поэтому из фоновой вкладки трек так не прочитать — для этого есть расширение."""
+
+    def __init__(self, skip=lambda: False):
         super().__init__(daemon=True)
         self.data = None
+        self.skip = skip            # True — трек уже передаёт расширение, страницу не трогаем
         self.commands = queue.Queue()
         self._player = None
         self._found_at = 0.0
         self._buttons = {}
-        self._meta = {}             # ("track"|"album", id) → (title, artists, cover, dur)
         self.start()
 
     def command(self, cmd):
@@ -192,6 +263,9 @@ class YandexWebSource(threading.Thread):
         return None
 
     def _poll(self):
+        if self.skip():
+            self._player, self.data = None, None
+            return
         auto = self.auto
         # плеер на странице может смениться (Моя волна ↔ нижняя панель) — периодически ищем заново
         if self._player is None or time.time() - self._found_at > 5:
@@ -225,41 +299,10 @@ class YandexWebSource(threading.Thread):
             return
         self._buttons = buttons
 
-        title = link_title or text_title or "—"
-        meta = self._lookup("track", track_id) if track_id else self._lookup("album", album_id) if album_id else None
-        meta = meta or {}
-        # в «Моей волне» ссылки на трек нет — ищем его по названию в треках альбома
-        song = meta.get("tracks", {}).get(title.casefold(), meta)
-        artist = ", ".join(artists) or song.get("artists", "")
         pos_txt, _, dur_txt = (tc or "").partition("/")
-        dur = spoken_seconds(dur_txt) or song.get("dur")
-        self.data = track(title, artist, "Пауза" in buttons, meta.get("cover"),
-                          spoken_seconds(pos_txt) if tc else None, dur)
-
-    def _lookup(self, kind, id_):
-        key = (kind, id_)
-        if key not in self._meta:
-            self._meta[key] = None
-            try:
-                url = f"https://api.music.yandex.net/tracks/{id_}" if kind == "track" else \
-                      f"https://api.music.yandex.net/albums/{id_}/with-tracks"
-                res = json.loads(http(url))["result"]
-                res = res[0] if isinstance(res, list) else res
-
-                def info(t):
-                    return {"artists": ", ".join(a["name"] for a in t.get("artists", [])),
-                            "dur": t.get("durationMs", 0) / 1000 or None}
-                meta = info(res)
-                if kind == "album":
-                    meta["dur"] = None
-                    meta["tracks"] = {t["title"].casefold(): info(t)
-                                      for vol in res.get("volumes", []) for t in vol}
-                if uri := res.get("coverUri") or (res.get("albums") or [{}])[0].get("coverUri"):
-                    meta["cover"] = http("https://" + uri.replace("%%", "400x400"))
-                self._meta[key] = meta
-            except Exception:
-                pass
-        return self._meta[key]
+        self.data = yandex_track(link_title or text_title or "—", ", ".join(artists), "Пауза" in buttons,
+                                 spoken_seconds(pos_txt) if tc else None, spoken_seconds(dur_txt) or None,
+                                 track_id, album_id)
 
     def _press(self, cmd):
         for name in WEB_BUTTON[cmd]:
@@ -268,22 +311,111 @@ class YandexWebSource(threading.Thread):
                 return
 
 
+# ═════════════════ источник 3: расширение для браузера — видит и фоновые вкладки ═════════════════
+BRIDGE_PORT = 47821             # тот же порт прописан в browser-extension/background.js
+
+
+def _digits(v):
+    return v if isinstance(v, str) and v.isdigit() else None
+
+
+def _number(v):
+    return float(v) if isinstance(v, (int, float)) and math.isfinite(v) and v >= 0 else None
+
+
+class BridgeSource:
+    """Состояние плеера от расширения browser-extension/ по WebSocket на 127.0.0.1.
+    Windows видит только активную вкладку браузера, а расширение — страницу Яндекс Музыки всегда."""
+
+    def __init__(self):
+        self.data = None
+        self._tabs = {}             # (соединение, вкладка) → {"ws", "tab", "data", "seen"}
+        self._active = None
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+        asyncio.run_coroutine_threadsafe(self._serve(), self.loop)
+
+    async def _serve(self):
+        from websockets.asyncio.server import serve
+        try:
+            self._server = await serve(self._client, "127.0.0.1", BRIDGE_PORT)
+        except OSError:
+            pass                    # порт занят — скорее всего, плеер уже запущен
+
+    async def _client(self, ws):
+        # пускаем только расширения браузера — обычным сайтам здесь делать нечего
+        if not ws.request.headers.get("Origin", "").startswith("chrome-extension://"):
+            return
+        try:
+            async for raw in ws:
+                try:
+                    msg = json.loads(raw)
+                    key = (id(ws), msg.get("tab"))
+                    if msg.get("type") == "state":
+                        prev = self._tabs.get(key)
+                        data = await self.loop.run_in_executor(None, self._track, msg, prev and prev["data"])
+                        self._tabs[key] = {"ws": ws, "tab": msg.get("tab"), "data": data, "seen": time.time()}
+                    elif msg.get("type") == "gone":
+                        self._tabs.pop(key, None)
+                    self._pick()
+                except Exception:
+                    pass
+        except Exception:
+            pass                    # соединение оборвалось
+        finally:
+            for key in [k for k in self._tabs if k[0] == id(ws)]:
+                del self._tabs[key]
+            self._pick()
+
+    @staticmethod
+    def _track(msg, prev):
+        pos, dur = _number(msg.get("pos")), _number(msg.get("dur"))
+        if dur and dur > 36000:     # ползунок может считать в миллисекундах
+            pos, dur = (pos or 0) / 1000, dur / 1000
+        timecode = msg.get("timecode")
+        if pos is None and isinstance(timecode, str):
+            pos_txt, _, dur_txt = timecode.partition("/")
+            pos, dur = spoken_seconds(pos_txt), dur or spoken_seconds(dur_txt) or None
+        title, artist = msg.get("title"), msg.get("artist")
+        t = yandex_track(title if isinstance(title, str) else "", artist if isinstance(artist, str) else "",
+                         msg.get("playing") is True, pos, dur,
+                         _digits(msg.get("trackId")), _digits(msg.get("albumId")), msg.get("artwork"))
+        # фоновая вкладка может не обновлять время — тогда отсчитываем его сами от прошлого изменения
+        if prev and prev["playing"] and t["playing"] and (prev["title"], prev["pos"]) == (t["title"], t["pos"]):
+            t["at"] = prev["at"]
+        return t
+
+    def _pick(self):
+        tabs = sorted(self._tabs.values(), key=lambda v: (v["data"]["playing"], v["seen"]), reverse=True)
+        self._active = tabs[0] if tabs else None
+        self.data = self._active["data"] if self._active else None
+
+    def command(self, cmd):
+        if active := self._active:
+            msg = json.dumps({"type": "command", "tab": active["tab"], "command": cmd})
+            asyncio.run_coroutine_threadsafe(active["ws"].send(msg), self.loop)
+
+
 # ═════════════════ что показывать ═════════════════
 class Media:
     def __init__(self):
-        self.smtc, self.web = SmtcSource(), YandexWebSource()
+        self.smtc, self.bridge = SmtcSource(), BridgeSource()
+        self.web = YandexWebSource(skip=lambda: self.bridge.data is not None)
         self.last = track("Ничего не играет", "включи музыку")
         self._override = None       # (playing, until) — мгновенный отклик кнопки play
 
     def source(self):
-        return self.smtc if self.smtc.data else self.web if self.web.data else None
+        """Сначала то, что сейчас играет; если ничего — по надёжности источника."""
+        live = [s for s in (self.smtc, self.bridge, self.web) if s.data]
+        return next((s for s in live if (s.data or {}).get("playing")), live[0] if live else None)
 
     def current(self):
         src = self.source()
-        if src:
-            self.last = src.data
+        data = src.data if src else None
+        if data:
+            self.last = data
         t = dict(self.last)
-        if not src:
+        if not data:
             t["playing"] = False
         if self._override and time.time() < self._override[1]:
             t["playing"] = self._override[0]
