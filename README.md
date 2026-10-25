@@ -28,7 +28,7 @@
    - на странице репозитория нажми зелёную кнопку **Code → Download ZIP** и распакуй архив в любую папку, например в «Документы»;
    - или через git:
      ```bash
-     git clone https://github.com/<автор>/taskbar-player.git
+     git clone https://github.com/egorikk58/taskbar-player.git
      ```
 2. Открой эту папку, кликни по адресной строке проводника, напиши `cmd` и нажми Enter.
 3. Установи зависимости:
