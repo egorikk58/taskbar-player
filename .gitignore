@@ -1,4 +1,5 @@
 # личные настройки (позиция окна, автоскрытие)
 taskbar_player.json
+taskbar_player.log
 __pycache__/
 *.pyc

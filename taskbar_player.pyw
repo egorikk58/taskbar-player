@@ -8,7 +8,8 @@
      (Яндекс Браузер не передаёт трек в Windows);
   3. без расширения — читаем плеер со страницы через UI Automation,
      но так видна только активная вкладка."""
-import asyncio, ctypes, json, math, queue, re, sys, threading, time, urllib.parse, urllib.request, winreg
+import asyncio, ctypes, faulthandler, json, math, os, queue, re, subprocess, sys, tempfile, threading, time
+import traceback, urllib.parse, urllib.request, winreg, xml.sax.saxutils
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,7 @@ from winrt.windows.storage.streams import Buffer, DataReader, InputStreamOptions
 
 HERE = Path(__file__).resolve().parent
 CFG = HERE / "taskbar_player.json"
+LOG = HERE / "taskbar_player.log"
 PREFER = "yandex"
 BARS = 26
 FALLBACK_ACCENT = QColor("#ffcc00")
@@ -478,32 +480,83 @@ class Spectrum:
 
 
 # ═════════════════ автозапуск ═════════════════
-RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
-APP_NAME = "TaskbarPlayer"
+# Через Планировщик заданий: раздел реестра Run Windows при входе иногда пропускает целиком,
+# а задание «при входе в систему» срабатывает надёжно и ждёт, пока поднимется рабочий стол.
+TASK = "TaskbarPlayer"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"   # так было в прошлых версиях
 
 
-def autostart_cmd():
-    pyw = Path(sys.executable).with_name("pythonw.exe")
-    return f'"{pyw}" "{Path(__file__).resolve()}"'
+def _schtasks(*args):
+    return subprocess.run(["schtasks", *args], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
 
 
-def autostart_enabled():
+def _task_xml():
+    e = xml.sax.saxutils.escape
+    user = e(f"{os.environ.get('USERDOMAIN', '')}\\{os.environ['USERNAME']}")
+    pyw = e(str(Path(sys.executable).with_name("pythonw.exe")))
+    script = Path(__file__).resolve()
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Taskbar Player — мини-плеер Яндекс Музыки</Description></RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId><Delay>PT10S</Delay></LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec><Command>{pyw}</Command><Arguments>"{e(str(script))}"</Arguments><WorkingDirectory>{e(str(script.parent))}</WorkingDirectory></Exec>
+  </Actions>
+</Task>"""
+
+
+def _drop_run_key():
     try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
-            return winreg.QueryValueEx(k, APP_NAME)[0] == autostart_cmd()
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, TASK)
+        return True
     except OSError:
         return False
 
 
+def autostart_enabled():
+    r = _schtasks("/Query", "/TN", TASK, "/XML")
+    text = r.stdout.decode("utf-16" if r.stdout[:2] == b"\xff\xfe" else "mbcs", "ignore")
+    return r.returncode == 0 and str(Path(__file__).resolve()).lower() in text.lower()
+
+
 def set_autostart(on):
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
-        if on:
-            winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, autostart_cmd())
-        else:
-            try:
-                winreg.DeleteValue(k, APP_NAME)
-            except OSError:
-                pass
+    _drop_run_key()
+    if not on:
+        _schtasks("/Delete", "/TN", TASK, "/F")
+        return
+    xml_file = Path(tempfile.gettempdir()) / "TaskbarPlayer-task.xml"
+    xml_file.write_text(_task_xml(), encoding="utf-16")
+    r = _schtasks("/Create", "/TN", TASK, "/XML", str(xml_file), "/F")
+    xml_file.unlink(missing_ok=True)
+    if r.returncode:
+        print("не удалось создать задание автозапуска:", r.stderr.decode("mbcs", "ignore").strip())
+
+
+def migrate_autostart():
+    """Автозапуск из прошлых версий (раздел Run) переносим в Планировщик заданий."""
+    if _drop_run_key():
+        set_autostart(True)
+
+
+def already_running():
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    already_running.mutex = kernel32.CreateMutexW(None, False, "Local\\TaskbarPlayer")   # живёт до выхода
+    return ctypes.get_last_error() == 183   # ERROR_ALREADY_EXISTS
 
 
 # ═════════════════ окно ═════════════════
@@ -603,8 +656,11 @@ class Player(QWidget):
     def _clamp(self, pt):
         """Ближайшая позиция окна, при которой карточка целиком на экране."""
         center = pt + QPoint(self.width() // 2, self.height() // 2)
+        screens = QGuiApplication.screens()
+        if not screens:
+            return pt
         scr = QGuiApplication.screenAt(center) or min(
-            QGuiApplication.screens(), key=lambda s: (s.geometry().center() - center).manhattanLength())
+            screens, key=lambda s: (s.geometry().center() - center).manhattanLength())
         g = scr.geometry()
         x = min(max(pt.x(), g.left() + EDGE - self.M), g.left() + g.width() - EDGE - self.M - self.W)
         y = min(max(pt.y(), g.top() + EDGE - self.M), g.top() + g.height() - EDGE - self.M - self.H)
@@ -927,9 +983,44 @@ class Player(QWidget):
         self.build_menu().exec(e.globalPos())
 
 
+def setup_log():
+    """pythonw молча проглатывает ошибки — пишем их в taskbar_player.log рядом со скриптом."""
+    big = LOG.exists() and LOG.stat().st_size > 1_000_000
+    log = open(LOG, "w" if big else "a", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr = log
+    faulthandler.enable(log)        # и падения внутри библиотек на C
+
+    def report(kind, value, tb):
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), "ошибка:")
+        traceback.print_exception(kind, value, tb)
+    sys.excepthook = report
+    threading.excepthook = lambda a: report(a.exc_type, a.exc_value, a.exc_traceback)
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), "запуск")
+    return log
+
+
+def wait_for_desktop(app, timeout=60):
+    """Сразу после входа в Windows экран и трей бывают ещё не готовы — ждём их."""
+    end = time.time() + timeout
+    while time.time() < end:
+        app.processEvents()
+        if QGuiApplication.screens() and QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        time.sleep(1)
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), "экран или трей так и не появились, запускаемся как есть")
+
+
 if __name__ == "__main__":
+    _log = setup_log()
+    if already_running():
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), "плеер уже запущен — вторая копия не нужна")
+        sys.exit(0)
+    migrate_autostart()
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("TaskbarPlayer")
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)  # окно прячется, а плеер продолжает ждать музыку
+    wait_for_desktop(app)
     w = Player()
-    sys.exit(app.exec())
+    code = app.exec()
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), "выход, код", code)
+    sys.exit(code)
